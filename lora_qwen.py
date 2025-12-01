@@ -41,6 +41,7 @@ class DummyRotaryEmbedding(nn.Module):
         self.max_position_embeddings = max_position_embeddings
 
     def forward(self, x, seq_len=None):
+        raise RuntimeError("✅ SURGERY SUCCESSFUL: The model tried to use my custom RoPE!")
         # Always return Identity (Pos 0)
         shape = (1, 1, seq_len, self.dim)
         return (torch.ones(shape, device=x.device, dtype=x.dtype), torch.zeros(shape, device=x.device, dtype=x.dtype))
@@ -78,9 +79,9 @@ def train():
     # !!! CHOOSE MODE HERE !!! 
     # Change to 'psystem' for your real experiment
     # Change to 'dummy' to verify patching works (Loss should be bad)
-    SURGERY_MODE = "psystem" 
+    SURGERY_MODE = "dummy" 
     
-    #model = inject_rope_surgery(model, mode=SURGERY_MODE)
+    model = inject_rope_surgery(model, mode=SURGERY_MODE)
 
     # LORA
     peft_config = LoraConfig(
