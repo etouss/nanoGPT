@@ -80,7 +80,7 @@ def train():
     # Change to 'dummy' to verify patching works (Loss should be bad)
     SURGERY_MODE = "psystem" 
     
-    model = inject_rope_surgery(model, mode=SURGERY_MODE)
+    #model = inject_rope_surgery(model, mode=SURGERY_MODE)
 
     # LORA
     peft_config = LoraConfig(
