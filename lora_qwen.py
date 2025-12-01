@@ -194,7 +194,7 @@ def train():
         attn_implementation="eager"
     )
 
-    model = inject_psystem_surgery(model)
+    #model = inject_psystem_surgery(model)
     
     print("🚚 Moving to CUDA...")
     model.to("cuda")
