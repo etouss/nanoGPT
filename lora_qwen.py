@@ -82,6 +82,7 @@ def train():
     SURGERY_MODE = "dummy" 
     
     model = inject_rope_surgery(model, mode=SURGERY_MODE)
+    print(model.model.layers[0].self_attn)
 
     # LORA
     peft_config = LoraConfig(
