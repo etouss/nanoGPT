@@ -129,12 +129,12 @@ def train():
     model = AutoModelForCausalLM.from_pretrained(
         model_id, 
         device_map="auto",
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16, 
         attn_implementation="eager" 
     )
 
-    # B. Perform Surgery (Before LoRA!)
-    #model = inject_psystem_rope(model)
+    # B. Perform Surgery
+    model = inject_psystem_rope(model)
 
     # C. Apply LoRA
     peft_config = LoraConfig(
@@ -145,7 +145,6 @@ def train():
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], 
         bias="none",
     )
-    
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
 
@@ -155,12 +154,12 @@ def train():
     def format_prompt(sample):
         return f"<|im_start|>user\n{sample['instruction']}\n<|im_end|>\n<|im_start|>assistant\n{sample['output']}\n<|im_end|>"
 
-    # E. Trainer with SFTConfig (THE FIX IS HERE)
-    # We use SFTConfig instead of TrainingArguments
+    # E. Trainer Setup
+    # FIX: In trl>=0.25.0, use 'max_length' instead of 'max_seq_length' inside SFTConfig
     training_args = SFTConfig(
         output_dir="./qwen-psystem-rope-adapter",
-        max_seq_length=1024,          # <--- Moved inside here
-        dataset_text_field="text",    # <--- Explicitly define text field usually required
+        dataset_text_field="text",    
+        max_length=1024,              # <--- RENAMED FROM max_seq_length
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
         learning_rate=2e-4,
@@ -171,15 +170,15 @@ def train():
         fp16=False,
         bf16=True,
         report_to="none",
-        packing=False                 # Explicitly disable packing if not needed
+        packing=False
     )
 
     trainer = SFTTrainer(
         model=model,
         train_dataset=dataset,
         formatting_func=format_prompt,
-        args=training_args,           # Pass the SFTConfig here
-        # max_seq_length is REMOVED from here
+        args=training_args,
+        # max_seq_length=1024  <--- REMOVED (It is now max_length in args)
     )
 
     print("🚀 Launching P-System Training...")
