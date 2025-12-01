@@ -104,11 +104,22 @@ class HemisphereQwen2RotaryEmbedding(nn.Module):
 def psystem_forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, **kwargs):
     bsz, q_len, _ = hidden_states.size()
 
-    # Robust attribute access
+    # FIX: Robustly get attributes that might be missing on 'self'
     num_heads = getattr(self, 'num_heads', self.config.num_attention_heads)
     num_key_value_heads = getattr(self, 'num_key_value_heads', self.config.num_key_value_heads)
-    head_dim = getattr(self, 'head_dim', self.config.hidden_size // num_heads)
     
+    # Calculate head_dim if missing
+    if hasattr(self, 'head_dim'):
+        head_dim = self.head_dim
+    else:
+        head_dim = self.config.hidden_size // num_heads
+
+    # FIX: Robustly get hidden_size (The source of your crash)
+    if hasattr(self, 'hidden_size'):
+        hidden_size = self.hidden_size
+    else:
+        hidden_size = self.config.hidden_size
+
     query_states = self.q_proj(hidden_states)
     key_states = self.k_proj(hidden_states)
     value_states = self.v_proj(hidden_states)
@@ -133,7 +144,6 @@ def psystem_forward(self, hidden_states, attention_mask=None, position_ids=None,
         cache_kwargs = {"sin": sin_k, "cos": cos_k}
         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    # This caused the crash before, but now we guarantee key_states is 4D
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
@@ -147,7 +157,10 @@ def psystem_forward(self, hidden_states, attention_mask=None, position_ids=None,
     attn_output = torch.matmul(attn_weights, value_states)
 
     attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+    
+    # FIX: Use the robust hidden_size variable we defined at the top
+    attn_output = attn_output.reshape(bsz, q_len, hidden_size)
+    
     attn_output = self.o_proj(attn_output)
 
     return attn_output, None, past_key_value
