@@ -4,7 +4,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from peft import LoraConfig, get_peft_model, TaskType
 from datasets import load_dataset
-from trl import SFTTrainer
+from trl import SFTTrainer, SFTConfig
 
 # ==============================================================================
 # 1. THE HETEROGENEOUS CATALYST (Multi-Base RoPE)
@@ -124,23 +124,22 @@ def train():
     
     # A. Load Model & Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    tokenizer.pad_token = tokenizer.eos_token # Qwen doesn't have a pad token by default
+    tokenizer.pad_token = tokenizer.eos_token 
     
     model = AutoModelForCausalLM.from_pretrained(
         model_id, 
         device_map="auto",
         torch_dtype=torch.bfloat16,
-        attn_implementation="eager" # Required for custom RoPE injection compatibility
+        attn_implementation="eager" 
     )
 
     # B. Perform Surgery (Before LoRA!)
     #model = inject_psystem_rope(model)
 
     # C. Apply LoRA
-    # We target q_proj and k_proj heavily because they interact with the Position Catalyst.
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        r=64,                # High rank to allow significant re-alignment of physics
+        r=64,                
         lora_alpha=128,
         lora_dropout=0.05,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], 
@@ -151,34 +150,36 @@ def train():
     model.print_trainable_parameters()
 
     # D. Load Dataset
-    # OpenHermes 2.5 is great for reasoning. We take a small subset for a fast demo.
     dataset = load_dataset("teknium/OpenHermes-2.5", split="train[:5000]") 
     
     def format_prompt(sample):
-        # Qwen chat format
         return f"<|im_start|>user\n{sample['instruction']}\n<|im_end|>\n<|im_start|>assistant\n{sample['output']}\n<|im_end|>"
 
-    # E. Trainer
-    training_args = TrainingArguments(
+    # E. Trainer with SFTConfig (THE FIX IS HERE)
+    # We use SFTConfig instead of TrainingArguments
+    training_args = SFTConfig(
         output_dir="./qwen-psystem-rope-adapter",
+        max_seq_length=1024,          # <--- Moved inside here
+        dataset_text_field="text",    # <--- Explicitly define text field usually required
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
-        learning_rate=2e-4, # Slightly higher LR for structural adaptation
+        learning_rate=2e-4,
         logging_steps=10,
         num_train_epochs=1,
         save_strategy="steps",
-        save_steps=1000,
+        save_steps=100,
         fp16=False,
-        bf16=True, # Recommended for Qwen
-        report_to="none"
+        bf16=True,
+        report_to="none",
+        packing=False                 # Explicitly disable packing if not needed
     )
 
     trainer = SFTTrainer(
         model=model,
         train_dataset=dataset,
         formatting_func=format_prompt,
-        max_seq_length=1024,
-        args=training_args,
+        args=training_args,           # Pass the SFTConfig here
+        # max_seq_length is REMOVED from here
     )
 
     print("🚀 Launching P-System Training...")
