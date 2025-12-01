@@ -85,4 +85,46 @@ def train():
     # LORA
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM, r=64, lora_alpha=128, lora_dropout=0.05,
-        target_modules=["q_proj
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], bias="none",
+    )
+    model = get_peft_model(model, peft_config)
+
+    # DATASET
+    dataset = load_dataset("teknium/OpenHermes-2.5", split="train[:500]") # Small subset for quick check
+    
+    def format_prompt(sample):
+        conversations = sample['conversations']
+        role_map = {"human": "user", "gpt": "assistant", "system": "system"}
+        text = ""
+        for turn in conversations:
+            text += f"<|im_start|>{role_map.get(turn['from'], turn['from'])}\n{turn['value']}<|im_end|>\n"
+        return text + "<|im_start|>assistant\n"
+
+    # TRAINER
+    training_args = SFTConfig(
+        output_dir=f"./qwen-{SURGERY_MODE}-check",
+        dataset_text_field="text",
+        max_length=512,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,
+        learning_rate=2e-4,
+        logging_steps=5,
+        num_train_epochs=1,
+        fp16=False,
+        bf16=True,
+        report_to="none",
+        packing=False
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        train_dataset=dataset,
+        formatting_func=format_prompt,
+        args=training_args
+    )
+
+    print(f"🚀 Launching {SURGERY_MODE.upper()} sanity check...")
+    trainer.train()
+
+if __name__ == "__main__":
+    train()
