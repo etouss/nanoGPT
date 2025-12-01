@@ -8,7 +8,7 @@ from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
 
 # ==============================================================================
-# 1. THE "HEMISPHERE" ROPE (GQA Optimized)
+# 1. THE "HEMISPHERE" ROPE (GQA Optimized & Fixed Init)
 # ==============================================================================
 class HemisphereQwen2RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, config=None):
@@ -16,35 +16,37 @@ class HemisphereQwen2RotaryEmbedding(nn.Module):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         
-        # Qwen-0.5B has 2 KV heads. We assign a distinct base to each KV head.
-        # Group 0 -> Local Physics
-        # Group 1 -> Global Physics
+        # Stats
         self.num_kv_heads = config.num_key_value_heads # 2
         self.num_q_heads = config.num_attention_heads  # 14
         self.group_size = self.num_q_heads // self.num_kv_heads # 7
 
+        # P-SYSTEM LOGIC: 2 Physics Environments
         min_base = 100.0
         max_base = 1000000.0
         
-        # Create 2 bases (one for each KV head)
+        # 1. Create Bases for the 2 KV groups
+        # Group 0 (Local) -> 100.0
+        # Group 1 (Global) -> 1,000,000.0
         bases_kv = torch.tensor([min_base, max_base], device=device).view(2, 1) # [2, 1]
         
-        # EXPAND TO QUERY HEADS
-        # We repeat each base 7 times to match the 14 Query heads
-        # Result: [100, 100... (7 times), 1M, 1M... (7 times)]
+        # 2. Expand to Query Heads
         self.bases_q = bases_kv.repeat_interleave(self.group_size, dim=0) # [14, 1]
         self.bases_k = bases_kv # [2, 1]
 
-        # Compute Frequencies
+        # 3. Compute Frequencies (FIXED INIT: Use local vars for calculation)
         dim_indices = torch.arange(0, dim, 2, dtype=torch.float32, device=device)
         term = dim_indices / dim
         
-        self.inv_freq_q = 1.0 / (self.bases_q ** term) # [14, Dim/2]
-        self.inv_freq_k = 1.0 / (self.bases_k ** term) # [2, Dim/2]
+        # Calculate tensors
+        _inv_freq_q = 1.0 / (self.bases_q ** term) # [14, Dim/2]
+        _inv_freq_k = 1.0 / (self.bases_k ** term) # [2, Dim/2]
         
-        self.register_buffer("inv_freq_q", self.inv_freq_q, persistent=False)
-        self.register_buffer("inv_freq_k", self.inv_freq_k, persistent=False)
+        # Register correctly
+        self.register_buffer("inv_freq_q", _inv_freq_q, persistent=False)
+        self.register_buffer("inv_freq_k", _inv_freq_k, persistent=False)
         
+        # Cache buffers
         self.register_buffer("cos_q", None, persistent=False)
         self.register_buffer("sin_q", None, persistent=False)
         self.register_buffer("cos_k", None, persistent=False)
@@ -69,7 +71,6 @@ class HemisphereQwen2RotaryEmbedding(nn.Module):
         self.register_buffer("sin_k", emb_k.sin().unsqueeze(0).to(dtype), persistent=False)
 
     def forward(self, x, seq_len=None, position_ids=None, **kwargs):
-        # Handle 'x' being Q or K? No, we just need seq_len.
         if seq_len is None:
             if position_ids is not None:
                 seq_len = position_ids.shape[-1]
@@ -88,12 +89,12 @@ class HemisphereQwen2RotaryEmbedding(nn.Module):
         )
 
 # ==============================================================================
-# 2. MONKEY PATCH FORWARD (AttributeError Fixed)
+# 2. MONKEY PATCH FORWARD (GQA & Attrib Fix)
 # ==============================================================================
 def psystem_forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, **kwargs):
     bsz, q_len, _ = hidden_states.size()
 
-    # FIX: Use self.config if attributes are missing on self
+    # FIX: Robustly get attributes that might be missing on 'self' in some HF versions
     num_heads = getattr(self, 'num_heads', self.config.num_attention_heads)
     num_key_value_heads = getattr(self, 'num_key_value_heads', self.config.num_key_value_heads)
     head_dim = getattr(self, 'head_dim', self.config.hidden_size // num_heads)
@@ -115,7 +116,7 @@ def psystem_forward(self, hidden_states, attention_mask=None, position_ids=None,
     cos_q, sin_q, cos_k, sin_k = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
     # Rotate Q using the Expanded Bases (14 heads)
-    # Note: We pass 'query_states' as K arg just to satisfy the function sig, we ignore the output
+    # We pass query_states twice to satisfy signature, ignoring 2nd output
     query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos_q, sin_q)
     
     # Rotate K using the Compact Bases (2 heads)
@@ -123,10 +124,11 @@ def psystem_forward(self, hidden_states, attention_mask=None, position_ids=None,
     # ----------------------
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin_k, "cos": cos_k} # Cache stores K-physics
+        # Cache stores K-physics (Group-aligned)
+        cache_kwargs = {"sin": sin_k, "cos": cos_k} 
         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    # Repeat K/V for GQA
+    # Repeat K/V for GQA standard calculation
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
@@ -159,7 +161,7 @@ def inject_psystem_surgery(model):
     head_dim = config.hidden_size // config.num_attention_heads
     
     count = 0
-    # Unwrap to find layers
+    # Robustly find layers
     base_model = getattr(model, "model", model)
     if hasattr(base_model, "model"): base_model = base_model.model
 
@@ -210,7 +212,7 @@ def train():
     model.print_trainable_parameters()
 
     # Data
-    dataset = load_dataset("teknium/OpenHermes-2.5", split="train[:5000]") 
+    dataset = load_dataset("teknium/OpenHermes-2.5", split="train[:2000]") 
     
     def format_prompt(sample):
         conversations = sample['conversations']
@@ -220,6 +222,7 @@ def train():
             text += f"<|im_start|>{role_map.get(turn['from'], turn['from'])}\n{turn['value']}<|im_end|>\n"
         return text + "<|im_start|>assistant\n"
 
+    # Trainer Config
     training_args = SFTConfig(
         output_dir="./qwen-psystem-hemisphere",
         dataset_text_field="text",
