@@ -78,7 +78,7 @@ def train():
     # !!! CHOOSE MODE HERE !!! 
     # Change to 'psystem' for your real experiment
     # Change to 'dummy' to verify patching works (Loss should be bad)
-    SURGERY_MODE = "dummy" 
+    SURGERY_MODE = "psystem" 
     
     model = inject_rope_surgery(model, mode=SURGERY_MODE)
 
