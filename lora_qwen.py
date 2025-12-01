@@ -87,7 +87,12 @@ def train():
     dataset = load_dataset("teknium/OpenHermes-2.5", split="train[:50]") 
     
     def format_prompt(sample):
-        return f"<|im_start|>user\n{sample['instruction']}\n<|im_end|>\n"
+        conversations = sample['conversations']
+        role_map = {"human": "user", "gpt": "assistant", "system": "system"}
+        text = ""
+        for turn in conversations:
+            text += f"<|im_start|>{role_map.get(turn['from'], turn['from'])}\n{turn['value']}<|im_end|>\n"
+        return text + "<|im_start|>assistant\n"
 
     # Trainer
     training_args = SFTConfig(
