@@ -67,7 +67,7 @@ def train():
     )
 
     # --- FIX 2: APPLY SURGERY BEFORE PEFT & DEVICE MOVE ---
-    model = inject_rope_surgery(model)
+    #model = inject_rope_surgery(model)
 
     # --- FIX 3: MOVE TO GPU MANUALLY ---
     print("🚚 Moving model to GPU...")
