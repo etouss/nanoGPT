@@ -54,6 +54,9 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+rope_type: str = 'none' # 'none', 'standard', 'multibase'
+rope_min_base: float = 100.0
+rope_max_base: float = 100000.0
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations

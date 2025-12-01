@@ -15,6 +15,110 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
+
+class RotaryEmbedding(nn.Module):
+    """ Standard RoPE: Homogeneous Catalyst (Base 10,000 for everyone) """
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        
+        # Standard frequency calculation
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.register_buffer("cos_cached", None, persistent=False)
+        self.register_buffer("sin_cached", None, persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # x: [B, n_head, T, head_dim]
+        if seq_len > self.max_position_embeddings:
+            self.max_position_embeddings = seq_len
+            
+        if self.cos_cached is None or self.cos_cached.shape[2] < seq_len:
+            t = torch.arange(self.max_position_embeddings, device=x.device, dtype=self.inv_freq.dtype)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1) # [Max_T, Dim]
+            
+            # Reshape for broadcasting: [1, 1, Max_T, Dim]
+            # Standard RoPE broadcasts across Batch and Heads
+            self.cos_cached = emb.cos()[None, None, :, :]
+            self.sin_cached = emb.sin()[None, None, :, :]
+
+        return self.cos_cached[:, :, :seq_len, ...], self.sin_cached[:, :, :seq_len, ...]
+
+class MultiBaseRotaryEmbedding(nn.Module):
+    """ 
+    P-System RoPE: Heterogeneous Catalysts. 
+    Each head gets a different 'Base', creating specialized chemical environments.
+    Head 0 = High Viscosity (Local), Head N = Superfluid (Global).
+    """
+    def __init__(self, dim, num_heads, max_position_embeddings=2048, min_base=100.0, max_base=100000.0, device=None):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        
+        # 1. Distribute bases geometrically across heads
+        # Shape: [n_head, 1] for broadcasting against dimensions
+        bases = torch.logspace(math.log10(min_base), math.log10(max_base), num_heads, device=device)
+        self.bases = bases.unsqueeze(1) 
+        
+        # 2. Compute frequencies per head
+        # dim_indices: [dim/2]
+        dim_indices = torch.arange(0, dim, 2, dtype=torch.float32, device=device)
+        
+        # Outer logic: freq[h, i] = 1 / (base[h] ** (2i/dim))
+        # inv_freq shape: [n_head, dim/2]
+        term = dim_indices / dim
+        self.inv_freq = 1.0 / (self.bases ** term)
+        
+        self.register_buffer("inv_freq_buffer", self.inv_freq)
+        self.register_buffer("cos_cached", None, persistent=False)
+        self.register_buffer("sin_cached", None, persistent=False)
+        self.max_position_embeddings = max_position_embeddings
+
+    def forward(self, x, seq_len=None):
+        # x: [B, n_head, T, head_dim]
+        if seq_len > self.max_position_embeddings:
+            self.max_position_embeddings = seq_len
+
+        if self.cos_cached is None or self.cos_cached.shape[2] < seq_len:
+            t = torch.arange(self.max_position_embeddings, device=x.device, dtype=self.inv_freq_buffer.dtype)
+            
+            # Complex broadcasting:
+            # t: [T]
+            # inv_freq: [n_head, dim/2]
+            # Result -> [n_head, T, dim/2]
+            freqs = torch.einsum("i,jk->jik", t, self.inv_freq_buffer)
+            
+            emb = torch.cat((freqs, freqs), dim=-1) # [n_head, T, dim]
+            
+            # Reshape for broadcasting: [1, n_head, T, Dim]
+            # Note: The 'n_head' dimension is NOT 1. Each head sees a different rotation.
+            self.cos_cached = emb.cos()[None, :, :, :]
+            self.sin_cached = emb.sin()[None, :, :, :]
+            
+        return self.cos_cached[:, :, :seq_len, ...], self.sin_cached[:, :, :seq_len, ...]
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    """Applies RoPE to q and k."""
+    # cos, sin shapes are either [1, 1, T, D] (Standard) or [1, H, T, D] (MultiBase)
+    # PyTorch broadcasting handles both cases automatically against q, k [B, H, T, D]
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -31,47 +135,60 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.head_dim = config.n_embd // config.n_head # Calc head dim
+        
+        # --- NEW: RoPE INITIALIZATION ---
+        self.rope_type = config.rope_type
+        if self.rope_type == 'standard':
+            self.rotary_emb = RotaryEmbedding(self.head_dim)
+        elif self.rope_type == 'multibase':
+            self.rotary_emb = MultiBaseRotaryEmbedding(
+                self.head_dim, 
+                self.n_head, 
+                min_base=config.rope_min_base, 
+                max_base=config.rope_max_base
+            )
+        else:
+            self.rotary_emb = None
+        # --------------------------------
+
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
+            print("WARNING: using slow attention.")
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # --- NEW: APPLY ROTARY EMBEDDINGS (THE CATALYST) ---
+        if self.rotary_emb is not None:
+            cos, sin = self.rotary_emb(v, seq_len=T)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        # ---------------------------------------------------
+
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
-            # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
+            y = att @ v 
+        
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -115,6 +232,10 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
+    rope_type: str = 'none' # 'none', 'standard', 'multibase'
+    rope_min_base: float = 100.0
+    rope_max_base: float = 100000.0
 
 class GPT(nn.Module):
 
@@ -171,24 +292,32 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device) 
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        tok_emb = self.transformer.wte(idx) 
+        
+        # --- MODIFIED: CONDITIONAL POSITIONAL EMBEDDING ---
+        if self.config.rope_type == 'none':
+            # Classic GPT-2 style (Absolute Additive)
+            pos_emb = self.transformer.wpe(pos) 
+            x = self.transformer.drop(tok_emb + pos_emb)
+        else:
+            # RoPE Style (Position is applied inside Attention)
+            # We do NOT add position to the residual stream here.
+            # Pure "Data" enters the system.
+            x = self.transformer.drop(tok_emb)
+        # --------------------------------------------------
+
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :]) 
             loss = None
 
         return logits, loss
