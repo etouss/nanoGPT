@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -6,86 +5,85 @@ from peft import LoraConfig, get_peft_model, TaskType
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
 
-# 1. ROBUST DUMMY CLASS (The Scream Test)
-class DummyRotaryEmbedding(nn.Module):
+# 1. THE AGGRESSIVE DUMMY
+class NuclearDummyRotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
+        print(f"👻 NuclearDummy Initialized (Dim: {dim})")
 
-    def forward(self, x, seq_len=None):
+    def forward(self, x, seq_len=None, position_ids=None, **kwargs):
         # IF THIS PRINTS, WE WIN.
-        print("\n\n >>> 🚨 SURGERY SUCCESSFUL: DUMMY ROPE CALLED! 🚨 <<< \n\n")
+        print(f"\n\n >>> ☢️ NUCLEAR SUCCESS: Dummy RoPE called with shape {x.shape}! ☢️ <<< \n\n")
         raise RuntimeError("✅ SURGERY SUCCESSFUL: The model tried to use my custom RoPE!")
         
-        # Unreachable code, but keeps shape correct just in case
-        shape = (1, 1, seq_len, self.dim)
+        # Fallback for shape compatibility if we didn't raise
+        shape = (1, 1, 2048, self.dim) # Huge buffer to be safe
         return (torch.ones(shape, device=x.device, dtype=x.dtype), 
                 torch.zeros(shape, device=x.device, dtype=x.dtype))
 
-# 2. SURGERY FUNCTION
-def inject_rope_surgery(model):
-    print(f"\n🔬 STARTING SURGERY...")
-    
-    # Unwrap PEFT if present to find the base model
-    base_model = getattr(model, "model", model)
-    if hasattr(base_model, "model"):
-        base_model = base_model.model
-        
-    # Check what Attention implementation is being used
-    first_layer = base_model.layers[0]
-    attn_type = type(first_layer.self_attn).__name__
-    print(f"🧐 Detected Attention Implementation: {attn_type}")
-    
-    if "Flash" in attn_type or "Sdpa" in attn_type:
-        print("⚠️ WARNING: Flash/SDPA Attention detected. These optimized kernels might bypass custom modules!")
-        print("   We will force Eager Execution in the loader.")
-
-    for i, layer in enumerate(base_model.layers):
-        # Create Dummy
-        head_dim = layer.self_attn.head_dim
-        new_rope = DummyRotaryEmbedding(head_dim, device=base_model.device)
-        
-        # KEY: Force the replacement
-        layer.self_attn.rotary_emb = new_rope
-    
-    print("✅ Surgery Complete. All Rotary Embeddings are now DUMMY.\n")
-    return model
+# 2. RECURSIVE REPLACER
+def replace_rope_recursively(module, target_cls_name="RotaryEmbedding"):
+    """
+    Traverses the module tree. If it finds a child that looks like RoPE, it kills it.
+    """
+    count = 0
+    for name, child in module.named_children():
+        # Check if this child is a Rotary Embedding
+        if "RotaryEmbedding" in child.__class__.__name__:
+            print(f"   ⚔️ Found target: {name} ({child.__class__.__name__})")
+            
+            # Create Replacement
+            # Try to grab dim from the existing child
+            dim = getattr(child, "dim", 64) 
+            new_rope = NuclearDummyRotaryEmbedding(dim, device=child.inv_freq.device if hasattr(child, 'inv_freq') else None)
+            
+            # SWAP
+            setattr(module, name, new_rope)
+            count += 1
+        else:
+            # Recurse
+            count += replace_rope_recursively(child, target_cls_name)
+    return count
 
 def train():
     model_id = "Qwen/Qwen2.5-0.5B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    tokenizer.pad_token = tokenizer.eos_token 
     
-    # --- FIX 1: FORCE EAGER & CPU LOAD ---
-    print("📥 Loading Model on CPU (Eager Mode)...")
+    print("📥 Loading Model (CPU, Eager)...")
     model = AutoModelForCausalLM.from_pretrained(
         model_id, 
-        device_map=None,             # <--- DISABLE ACCELERATE AUTO DEVICE MAP
-        torch_dtype=torch.bfloat16, 
-        attn_implementation="eager"  # <--- FORCE PYTHON PATH
+        device_map=None, 
+        torch_dtype=torch.float32, # Use float32 on CPU to avoid potential bfloat16 errors
+        attn_implementation="eager"
     )
 
-    # --- FIX 2: APPLY SURGERY BEFORE PEFT & DEVICE MOVE ---
-    #model = inject_rope_surgery(model)
+    print("\n🔍 STARTING NUCLEAR SEARCH & DESTROY...")
+    # We search the ENTIRE model structure, not just layers
+    replacements = replace_rope_recursively(model)
+    print(f"✅ Replaced {replacements} RotaryEmbedding instances globally.")
+    
+    if replacements == 0:
+        print("❌ ERROR: No RotaryEmbeddings found! The class name might be different.")
+        # Let's inspect the model structure to find the real name
+        print(model)
+        return
 
-    # --- FIX 3: MOVE TO GPU MANUALLY ---
-    print("🚚 Moving model to GPU...")
+    print("🚚 Moving to CUDA...")
     model.to("cuda")
 
-    # Apply LoRA
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=64, lora_alpha=128, lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], 
-        bias="none",
-    )
-    model = get_peft_model(model, peft_config)
-    model.print_trainable_parameters()
+    # Add a hook to the first attention layer to see if IT runs
+    # Find first layer
+    base_model = getattr(model, "model", model)
+    if hasattr(base_model, "layers"):
+        first_layer = base_model.layers[0].self_attn
+        def hook_fn(module, input, output):
+            print("👁️ HOOK: Attention Layer 0 Forward Pass Started!")
+        first_layer.register_forward_hook(hook_fn)
+        print("🪝 Forward hook attached to Attention Layer 0")
 
-    # Load Data
-    dataset = load_dataset("teknium/OpenHermes-2.5", split="train[:50]") 
-    
+    # Setup dummy training
+    dataset = load_dataset("teknium/OpenHermes-2.5", split="train[:10]") 
     def format_prompt(sample):
         conversations = sample['conversations']
         role_map = {"human": "user", "gpt": "assistant", "system": "system"}
@@ -94,17 +92,14 @@ def train():
             text += f"<|im_start|>{role_map.get(turn['from'], turn['from'])}\n{turn['value']}<|im_end|>\n"
         return text + "<|im_start|>assistant\n"
 
-    # Trainer
+    # Minimal Trainer
     training_args = SFTConfig(
-        output_dir="./qwen-dummy-debug",
+        output_dir="./nuclear-debug",
         dataset_text_field="text",
-        max_length=128,
+        max_length=64,
         per_device_train_batch_size=1,
-        learning_rate=2e-4,
-        max_steps=5,     # Only run a few steps to trigger the error
+        max_steps=1,
         logging_steps=1,
-        fp16=False,
-        bf16=True,
         report_to="none",
         packing=False
     )
@@ -116,13 +111,16 @@ def train():
         args=training_args
     )
 
-    print("🚀 Launching Training (Expect Crash)...")
+    print("🚀 Launching Training...")
     try:
         trainer.train()
     except RuntimeError as e:
-        print(f"\n\n🏆 SUCCESS! The model crashed with your error: {e}")
+        if "SURGERY SUCCESSFUL" in str(e):
+            print(f"\n\n🏆 MISSION ACCOMPLISHED: {e}")
+        else:
+            print(f"\n\n💥 CRASH (Unrelated): {e}")
     except Exception as e:
-        print(f"\n\n❌ FAILED with unexpected error: {e}")
+        print(f"\n\n❓ UNEXPECTED ERROR: {e}")
 
 if __name__ == "__main__":
     train()
