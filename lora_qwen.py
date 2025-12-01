@@ -210,7 +210,7 @@ def train():
     model.print_trainable_parameters()
 
     # Data
-    dataset = load_dataset("teknium/OpenHermes-2.5", split="train[:2000]") 
+    dataset = load_dataset("teknium/OpenHermes-2.5", split="train[:20000]") 
     
     def format_prompt(sample):
         conversations = sample['conversations']
