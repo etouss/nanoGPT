@@ -6,53 +6,70 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, apply_rotar
 from peft import LoraConfig, get_peft_model, TaskType
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
-import types
 
 # ==============================================================================
-# 1. THE EUKARYOTIC ROPE (GQA Compatible)
+# 1. THE "HEMISPHERE" ROPE (GQA Optimized)
 # ==============================================================================
-class MultiBaseQwen2RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, num_heads=14, num_kv_heads=2):
+class HemisphereQwen2RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, config=None):
         super().__init__()
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
-        self.num_heads = num_heads       # 14
-        self.num_kv_heads = num_kv_heads # 2
+        
+        # Qwen-0.5B has 2 KV heads. We assign a distinct base to each KV head.
+        # Group 0 -> Local Physics
+        # Group 1 -> Global Physics
+        self.num_kv_heads = config.num_key_value_heads # 2
+        self.num_q_heads = config.num_attention_heads  # 14
+        self.group_size = self.num_q_heads // self.num_kv_heads # 7
 
-        # P-SYSTEM LOGIC: Distribute Bases
-        # We generate 14 unique bases for the 14 Query Heads
         min_base = 100.0
-        max_base = 500000.0
+        max_base = 1000000.0
         
-        # Shape: [14, 1]
-        self.bases = torch.logspace(
-            math.log10(min_base), 
-            math.log10(max_base), 
-            num_heads, 
-            device=device
-        ).unsqueeze(1)
+        # Create 2 bases (one for each KV head)
+        bases_kv = torch.tensor([min_base, max_base], device=device).view(2, 1) # [2, 1]
         
-        # Compute frequencies for Q [14 heads]
+        # EXPAND TO QUERY HEADS
+        # We repeat each base 7 times to match the 14 Query heads
+        # Result: [100, 100... (7 times), 1M, 1M... (7 times)]
+        self.bases_q = bases_kv.repeat_interleave(self.group_size, dim=0) # [14, 1]
+        self.bases_k = bases_kv # [2, 1]
+
+        # Compute Frequencies
         dim_indices = torch.arange(0, dim, 2, dtype=torch.float32, device=device)
-        self.inv_freq = 1.0 / (self.bases ** (dim_indices / dim))
+        term = dim_indices / dim
         
-        self.register_buffer("inv_freq_buffer", self.inv_freq, persistent=False)
-        self.register_buffer("cos_cached", None, persistent=False)
-        self.register_buffer("sin_cached", None, persistent=False)
+        self.inv_freq_q = 1.0 / (self.bases_q ** term) # [14, Dim/2]
+        self.inv_freq_k = 1.0 / (self.bases_k ** term) # [2, Dim/2]
+        
+        self.register_buffer("inv_freq_q", self.inv_freq_q, persistent=False)
+        self.register_buffer("inv_freq_k", self.inv_freq_k, persistent=False)
+        
+        self.register_buffer("cos_q", None, persistent=False)
+        self.register_buffer("sin_q", None, persistent=False)
+        self.register_buffer("cos_k", None, persistent=False)
+        self.register_buffer("sin_k", None, persistent=False)
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq_buffer.dtype)
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq_q.dtype)
 
-        # Outer Product: [14, D/2] x [S] -> [14, S, D/2]
-        freqs = torch.einsum("hd,s->hsd", self.inv_freq_buffer, t)
-        emb = torch.cat((freqs, freqs), dim=-1) # [14, S, D]
+        # 1. Compute for Queries [14 Heads]
+        freqs_q = torch.einsum("hd,s->hsd", self.inv_freq_q, t)
+        emb_q = torch.cat((freqs_q, freqs_q), dim=-1) # [14, S, D]
         
-        # Cache Q-compatible shape: [1, 14, S, D]
-        self.register_buffer("cos_cached", emb.cos().unsqueeze(0).to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().unsqueeze(0).to(dtype), persistent=False)
+        # 2. Compute for Keys [2 Heads]
+        freqs_k = torch.einsum("hd,s->hsd", self.inv_freq_k, t)
+        emb_k = torch.cat((freqs_k, freqs_k), dim=-1) # [2, S, D]
+
+        # Cache with broadcasting shapes: [1, H, S, D]
+        self.register_buffer("cos_q", emb_q.cos().unsqueeze(0).to(dtype), persistent=False)
+        self.register_buffer("sin_q", emb_q.sin().unsqueeze(0).to(dtype), persistent=False)
+        self.register_buffer("cos_k", emb_k.cos().unsqueeze(0).to(dtype), persistent=False)
+        self.register_buffer("sin_k", emb_k.sin().unsqueeze(0).to(dtype), persistent=False)
 
     def forward(self, x, seq_len=None, position_ids=None, **kwargs):
+        # Handle 'x' being Q or K? No, we just need seq_len.
         if seq_len is None:
             if position_ids is not None:
                 seq_len = position_ids.shape[-1]
@@ -61,72 +78,59 @@ class MultiBaseQwen2RotaryEmbedding(nn.Module):
         
         if torch.is_tensor(seq_len): seq_len = seq_len.item()
 
-        if self.cos_cached is None or seq_len > self.max_seq_len_cached:
+        if self.cos_q is None or seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
 
-        # Return the full 14-head tensor
+        # Return EVERYTHING needed for the manual forward pass
         return (
-            self.cos_cached[:, :, :seq_len, ...],
-            self.sin_cached[:, :, :seq_len, ...]
+            self.cos_q[:, :, :seq_len, ...], self.sin_q[:, :, :seq_len, ...],
+            self.cos_k[:, :, :seq_len, ...], self.sin_k[:, :, :seq_len, ...]
         )
 
 # ==============================================================================
-# 2. CUSTOM FORWARD METHOD (The Monkey Patch)
+# 2. MONKEY PATCH FORWARD (AttributeError Fixed)
 # ==============================================================================
 def psystem_forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, **kwargs):
-    # This is a Modified Qwen2Attention.forward to handle Heterogeneous RoPE + GQA
-    
     bsz, q_len, _ = hidden_states.size()
 
+    # FIX: Use self.config if attributes are missing on self
+    num_heads = getattr(self, 'num_heads', self.config.num_attention_heads)
+    num_key_value_heads = getattr(self, 'num_key_value_heads', self.config.num_key_value_heads)
+    head_dim = getattr(self, 'head_dim', self.config.hidden_size // num_heads)
+    
     query_states = self.q_proj(hidden_states)
     key_states = self.k_proj(hidden_states)
     value_states = self.v_proj(hidden_states)
 
-    # Reshape
-    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
 
     kv_seq_len = key_states.shape[-2]
     if past_key_value is not None:
         kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    # --- P-SYSTEM LOGIC STARTS HERE ---
-    # 1. Get the 14-head Rotation Tensors [1, 14, S, D]
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-    
-    # 2. Apply to Query (Direct match: 14 vs 14) -> OK
-    # query_states: [B, 14, S, D] * cos: [1, 14, S, D]
-    query_states, _ = apply_rotary_pos_emb(query_states, key_states, cos, sin) # Ignore K output here
+    # --- P-SYSTEM LOGIC ---
+    # Retrieve pre-computed (Q-Physics, K-Physics) tuples
+    cos_q, sin_q, cos_k, sin_k = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
-    # 3. Apply to Key (Mismatch: 2 vs 14) -> MANUAL FIX
-    # We must downsample the 14-head physics to the 2-head physics.
-    # Logic: KV-Head 0 serves Q-Heads 0-6. Let's assign KV-Head 0 the physics of Q-Head 0 (or average).
-    # Simplest P-System Logic: The KV head adopts the Base of the *First* Q-head in its group.
+    # Rotate Q using the Expanded Bases (14 heads)
+    # Note: We pass 'query_states' as K arg just to satisfy the function sig, we ignore the output
+    query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos_q, sin_q)
     
-    # ratio = 14 // 2 = 7
-    ratio = self.num_heads // self.num_key_value_heads
-    
-    # Slice cos/sin to get only the representative heads (Indices: 0, 7)
-    # shape: [1, 2, S, D]
-    cos_k = cos[:, ::ratio, :, :]
-    sin_k = sin[:, ::ratio, :, :]
-    
-    # key_states: [B, 2, S, D] * cos_k: [1, 2, S, D] -> OK
-    # We use apply_rotary_pos_emb purely for the math helper, passing dummy Q
-    _, key_states = apply_rotary_pos_emb(key_states, key_states, cos_k, sin_k) 
-    # --- P-SYSTEM LOGIC ENDS ---
+    # Rotate K using the Compact Bases (2 heads)
+    _, key_states = apply_rotary_pos_emb(key_states, key_states, cos_k, sin_k)
+    # ----------------------
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos} # Pass original for cache consistency if needed
+        cache_kwargs = {"sin": sin_k, "cos": cos_k} # Cache stores K-physics
         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    # Repeat KV for GQA
+    # Repeat K/V for GQA
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-    # Standard Attention ...
-    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
     
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
@@ -147,26 +151,25 @@ def psystem_forward(self, hidden_states, attention_mask=None, position_ids=None,
 def inject_psystem_surgery(model):
     print("🔬 P-System Surgery: Patching Qwen2Attention...")
     
-    config = model.config
-    num_heads = config.num_attention_heads
-    num_kv_heads = config.num_key_value_heads
-    head_dim = config.hidden_size // num_heads
-
-    # 1. Replace the Method on the Class (Affects all instances)
-    # This is safer than replacing instances one by one
+    # Patch the class method
     Qwen2Attention.forward = psystem_forward
     print("   ✅ Monkey-patched Qwen2Attention.forward")
 
-    # 2. Replace the Rotary Embedding Modules
+    config = model.config
+    head_dim = config.hidden_size // config.num_attention_heads
+    
     count = 0
-    for layer in model.model.layers:
-        new_rope = MultiBaseQwen2RotaryEmbedding(
+    # Unwrap to find layers
+    base_model = getattr(model, "model", model)
+    if hasattr(base_model, "model"): base_model = base_model.model
+
+    for layer in base_model.layers:
+        new_rope = HemisphereQwen2RotaryEmbedding(
             dim=head_dim,
             max_position_embeddings=config.max_position_embeddings,
             base=config.rope_theta,
             device=model.device,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads
+            config=config # Pass config for head counts
         )
         layer.self_attn.rotary_emb = new_rope
         count += 1
@@ -175,12 +178,12 @@ def inject_psystem_surgery(model):
     return model
 
 # ==============================================================================
-# 4. MAIN TRAIN
+# 4. MAIN
 # ==============================================================================
 def train():
     model_id = "Qwen/Qwen2.5-0.5B-Instruct"
     
-    print("📥 Loading Model (CPU / Eager)...")
+    print("📥 Loading Model (CPU/Eager)...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     tokenizer.pad_token = tokenizer.eos_token 
     
@@ -188,10 +191,9 @@ def train():
         model_id, 
         device_map=None,
         torch_dtype=torch.float32, 
-        attn_implementation="eager" # Required for our custom forward to run
+        attn_implementation="eager"
     )
 
-    # Apply Surgery
     model = inject_psystem_surgery(model)
     
     print("🚚 Moving to CUDA...")
@@ -208,7 +210,7 @@ def train():
     model.print_trainable_parameters()
 
     # Data
-    dataset = load_dataset("teknium/OpenHermes-2.5", split="train[:2000]") 
+    dataset = load_dataset("teknium/OpenHermes-2.5", split="train[:5000]") 
     
     def format_prompt(sample):
         conversations = sample['conversations']
@@ -218,9 +220,8 @@ def train():
             text += f"<|im_start|>{role_map.get(turn['from'], turn['from'])}\n{turn['value']}<|im_end|>\n"
         return text + "<|im_start|>assistant\n"
 
-    # Trainer
     training_args = SFTConfig(
-        output_dir="./qwen-psystem-gqa",
+        output_dir="./qwen-psystem-hemisphere",
         dataset_text_field="text",
         max_length=1024,
         per_device_train_batch_size=4,
@@ -229,7 +230,7 @@ def train():
         logging_steps=10,
         num_train_epochs=1,
         save_strategy="steps",
-        save_steps=100,
+        save_steps=200,
         fp16=False,
         bf16=True,
         report_to="none",
@@ -243,9 +244,9 @@ def train():
         args=training_args
     )
 
-    print("🚀 Launching Training...")
+    print("🚀 Launching Hemisphere Training...")
     trainer.train()
-    trainer.save_model("./qwen-psystem-gqa-final")
+    trainer.save_model("./qwen-psystem-hemisphere-final")
 
 if __name__ == "__main__":
     train()
