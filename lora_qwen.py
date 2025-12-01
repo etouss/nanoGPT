@@ -110,7 +110,7 @@ def train():
     )
 
     # B. Perform Surgery
-    model = inject_psystem_rope(model)
+    #model = inject_psystem_rope(model)
 
     # C. Apply LoRA
     peft_config = LoraConfig(
@@ -177,7 +177,7 @@ def train():
     trainer.train()
     
     print("💾 Saving Adapter...")
-    trainer.save_model("./qwen-psystem-rope-final")
+    trainer.save_model("./qwen-baseline")
 
 if __name__ == "__main__":
     train()
